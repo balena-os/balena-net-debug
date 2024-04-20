@@ -1,0 +1,246 @@
+#!/bin/bash
+
+# Copyright 2024 Balena Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This is a NetworkManager dispatcher script that helps with debugging
+# network issues on devices running balenaOS.
+# The script tries to detect connectivity loss and recovery
+# on a particular interface of a device.
+# To achieve this it monitors two things:
+# * The global "connectivity-change" event - it detects the loss
+#   of connectivity and when the connection recovers, sets a tag
+#   informing about the downtime through balena API.
+# * The up and down events on a particular interface.
+
+# The script is enabled by placing it to either
+# * /mnt/boot/dispatcher.d/ and rebooting the device
+# or
+# * /etc/NetworkManager/dispatcher.d/ and restarting NetworkManager
+
+# The script must be executable to work properly, to be sure
+# you can use `chmod a+x 10netdebug`
+
+#
+# Configuration
+#
+
+# Which interface to watch for "up" and "down" events
+WATCH_INTERFACE="eth0"
+
+# Name of the tag informing about the last loss of connectivity
+CON_LOST_TAG="balena_debug_con_lost"
+
+# Name of the tag informing about the last "down" event on $WATCH_INTERFACE
+# This may or may not be set depending on whether failover is configured
+# and the balena API is reachable when the interface goes down
+IF_DOWN_TAG="balena_debug_if_down"
+
+# Name of the tag informing about the last "up" event on $WATCH_INTERFACE
+IF_UP_TAG="balena_debug_if_up"
+
+#
+# Start
+#
+
+. /usr/libexec/os-helpers-logging
+
+# Helper function that sets a tag for the current device in balenaCloud
+# Since we do not have PUT, we need to POST or PATCH
+# Usage: set_tag KEY VALUE
+set_tag() {
+  KEY="$1"
+  VALUE="$2"
+
+  info "Trying to set tag '${KEY}' to '${VALUE}' via balena API"
+
+  # balena-config-vars complains about unknown args
+  # shift away the two we consumed to make it happy
+  shift
+  shift
+
+  . /usr/sbin/balena-config-vars
+
+  # We do not want curl to hang for too long as there might be no connectivity
+  # At the same time it might take a few seconds after recovery
+  # for the connection to be usable for an API call
+  # Cap each attempt to 5 seconds and retry 3 times before giving up
+  HTTP_CODE=$(curl "${API_ENDPOINT}/v6/device_tag" \
+    -s -o /dev/null -w "%{http_code}" \
+    -X POST \
+    -m 5 \
+    --retry 3 \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${DEVICE_API_KEY}" \
+    -d "{\"device\":\"${DEVICE_ID}\",\"tag_key\":\"${KEY}\",\"value\":\"${VALUE}\"}")
+
+  # 201 means the tag was successfully added
+  if [ "${HTTP_CODE}" = "201" ]
+  then
+    info "New tag '${KEY}' created via balena API"
+    return 0
+  fi
+
+  # 409 means the tag is already there and we need to PATCH it
+  if [ "${HTTP_CODE}" = "409" ]
+  then
+    # This does not check the return code, but there is not much more we can do anyway
+    curl "${API_ENDPOINT}/v6/device_tag?\$filter=(tag_key%20eq%20'${KEY}')%20and%20(device%20eq%20${DEVICE_ID})" \
+      -s -o /dev/null \
+      -X PATCH \
+      -m 5 \
+      --retry 3 \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${DEVICE_API_KEY}" \
+      -d "{\"value\":\"${VALUE}\"}"
+    info "Existing tag '${KEY}' updated via balena API"
+    return 0
+  fi
+
+  # Anything else is unexpected
+  warn "Failed to set tag '${KEY}' via balena API"
+  return 1
+}
+
+
+EVENT_IF="$1"
+EVENT_NAME="$2"
+
+# These have to stay same between multiple runs of the script
+# and ideally survive a reboot
+NET_STATE_DIR="/mnt/data"
+CON_STATE_FILE="${NET_STATE_DIR}/last_connection_state"
+CON_DROP_FILE="${NET_STATE_DIR}/last_connection_drop"
+IF_DOWN_FILE="${NET_STATE_DIR}/last_if_down"
+
+
+# The connectivity-change event is global and has no interface
+if [ "${EVENT_NAME}" = "connectivity-change" ]
+then
+  # The conectivity state is "FULL" on a device with a working connection
+  # On devices with no connection (primary interface down and no failover)
+  # it oscillates between "NONE" (interface completely down)
+  # and "LIMITED" which indicates an attempt to bring the interface back up
+  # For the purpose of this script "NONE" and "LIMITED" are equivalent
+  # There are other possible states, but we do not expect to see them at all
+
+  # Have we seen this event before?
+  if [ -f "${CON_STATE_FILE}" ]
+  then
+    PREVIOUS_CON_STATE="$(cat "${CON_STATE_FILE}")"
+
+    if [ "${PREVIOUS_CON_STATE}" = "FULL" ]
+    then
+      if [ "${CONNECTIVITY_STATE}" = "NONE" ] || [ "${CONNECTIVITY_STATE}" = "LIMITED" ]
+      then
+        # We have detected the connection just got broken
+        # There is no point trying to call the API at this point
+        # Just log current time to use it later
+        date "+%s" > "${CON_DROP_FILE}"
+        info "Detected connectivity drop"
+      else
+        warn "Unexpected connectivity change from '${PREVIOUS_CON_STATE}' to '${CONNECTIVITY_STATE}'"
+      fi
+    fi
+
+    if [ "${PREVIOUS_CON_STATE}" = "NONE" ] || [ "${PREVIOUS_CON_STATE}" = "LIMITED" ]
+    then
+      if [ "${CONNECTIVITY_STATE}" = "FULL" ]
+      then
+        # We have detected the connection got fixed
+        # Have we seen the connection break before?
+        if [ -f "${CON_DROP_FILE}" ]
+        then
+          info "Detected connectivity back up"
+
+          DROP_TIME="$(cat "${CON_DROP_FILE}")"
+          FIX_TIME="$(date "+%s")"
+
+          DROP_DURATION=$["${FIX_TIME}" - "${DROP_TIME}"]
+
+          # Do not report drops shorter than 60 seconds
+          # This filters out temporary events, such as router/switch/device reboots
+          # It also filters out the initial setup after reboot
+          # It also filters out cases where NTP sync creates a drop of negative length
+          # None of these should be significant as we are primarily interested in drops
+          # that last for hours, on long running devices
+          if [ "${DROP_DURATION}" -lt 60 ]
+          then
+            info "The connection drop lasting ${DROP_DURATION} seconds seems too short to report"
+          else
+            # Report the drop to the API
+            set_tag "${CON_LOST_TAG}" "${DROP_TIME} - ${FIX_TIME} (${DROP_DURATION} seconds)"
+          fi
+        else
+          warn "The connection seems to get fixed, but we did not see it break"
+        fi
+
+        # The drop file should only exist while the connection is broken
+        rm -f "${CON_DROP_FILE}"
+      else
+        warn "Unexpected connectivity change from '${PREVIOUS_CON_STATE}' to '${CONNECTIVITY_STATE}'"
+      fi
+    fi
+  fi
+
+  echo "${CONNECTIVITY_STATE}" > "${CON_STATE_FILE}"
+fi
+
+# This is not a connectivity-change event
+# so we only care if the event is for $WATCH_INTERFACE
+if [ "${WATCH_INTERFACE}" != "${EVENT_IF}" ]
+then
+  exit 0
+fi
+
+NOW="$(date "+%s")"
+
+# This assumes the interface goes down on error, but that might need
+# extra configuration
+# Even a complete loss of IPv4 connectivity will not issue a "down"
+# event if IPv6 is available, unless `ipv4.may-fail` is set to false
+if [ "${EVENT_NAME}" = "down" ]
+then
+  # $WATCH_INTERFACE went down
+
+  # Note current time for later use
+  echo "${NOW}" > "${IF_DOWN_FILE}"
+
+  # We do not know whether we still have connectivity
+  # so we just try to set the down tag and hope for the best
+  # This is useful because if the down tag is set and a matching
+  # up tag is not, it identifies a device that experiences
+  # the issue but still has connectivity so it is available
+  # for live debugging
+  set_tag "${IF_DOWN_TAG}" "${NOW}"
+
+elif [ "${EVENT_NAME}" = "up" ]
+then
+  # $WATCH_INTERFACE went up
+
+  # Have we seen it go down before?
+  # If not, it is probably the first "up" after boot
+  if [ -f "${IF_DOWN_FILE}" ]
+  then
+    # Calculate the downtime
+    DOWN_TIME="$(cat "${IF_DOWN_FILE}")"
+    DOWN_DURATION=$["${NOW}" - "${DOWN_TIME}"]
+
+    # We should have connectivity now, set the up tag
+    set_tag "${IF_UP_TAG}" "${DOWN_TIME} - ${NOW} (${DOWN_DURATION} seconds)"
+  fi
+
+  # Even if setting the tag failed, we do not want to mix ups and downs
+  rm -f "${IF_DOWN_FILE}"
+fi
