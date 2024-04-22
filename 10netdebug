@@ -127,7 +127,7 @@ EVENT_NAME="$2"
 
 # These have to stay same between multiple runs of the script
 # and ideally survive a reboot
-NET_STATE_DIR="/mnt/data"
+NET_STATE_DIR="/mnt/state"
 CON_STATE_FILE="${NET_STATE_DIR}/last_connection_state"
 CON_DROP_FILE="${NET_STATE_DIR}/last_connection_drop"
 IF_DOWN_FILE="${NET_STATE_DIR}/last_if_down"
