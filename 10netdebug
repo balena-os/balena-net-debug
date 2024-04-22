@@ -39,6 +39,14 @@
 # Which interface to watch for "up" and "down" events
 WATCH_INTERFACE="eth0"
 
+# Do not report connection drops shorter than a certain limit (in seconds)
+# This filters out temporary events, such as router/switch/device reboots
+# It also filters out the initial setup after reboot
+# It also filters out cases where NTP sync creates a drop of negative length
+# None of these should be significant as we are primarily interested in drops
+# that last for hours, on long running devices
+CON_LOST_MIN_LEN="60"
+
 # Name of the tag informing about the last loss of connectivity
 CON_LOST_TAG="balena_debug_con_lost"
 
@@ -169,13 +177,8 @@ then
 
           DROP_DURATION=$["${FIX_TIME}" - "${DROP_TIME}"]
 
-          # Do not report drops shorter than 60 seconds
-          # This filters out temporary events, such as router/switch/device reboots
-          # It also filters out the initial setup after reboot
-          # It also filters out cases where NTP sync creates a drop of negative length
-          # None of these should be significant as we are primarily interested in drops
-          # that last for hours, on long running devices
-          if [ "${DROP_DURATION}" -lt 60 ]
+          # Do not report short drops
+          if [ "${DROP_DURATION}" -lt "${CON_LOST_MIN_LEN}" ]
           then
             info "The connection drop lasting ${DROP_DURATION} seconds seems too short to report"
           else
