@@ -1,0 +1,5 @@
+FROM balenalib/generic-amd64-alpine
+
+RUN apk add --no-cache tcpdump open-plc-utils arp-scan dhclient dhcpcd nmap
+
+CMD [ /usr/bin/balena-idle ]
