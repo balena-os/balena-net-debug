@@ -1,0 +1,253 @@
+#!/bin/bash
+
+# Copyright 2024 Balena Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#    http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# This is a NetworkManager dispatcher script that helps with debugging
+# network issues on devices running balenaOS.
+# The script tries to detect connectivity loss and recovery.
+# To achieve this it monitors the global "connectivity-change" event
+# which it uses to detect the loss of connectivity, run debugging tools
+# and when the connection recovers, sets a tag informing about
+# the downtime through balena API.
+
+# The script is enabled by placing it to either
+# * /mnt/boot/dispatcher.d/ and rebooting the device
+# or
+# * /etc/NetworkManager/dispatcher.d/ and restarting NetworkManager
+
+# The script must be executable to work properly, to be sure
+# you can use `chmod a+x 10netdebug`
+
+#
+# Configuration
+#
+
+# Name of the primary interface
+WATCH_INTERFACE="eth0"
+
+# Do not report connection drops shorter than a certain limit (in seconds)
+# This filters out temporary events, such as router/switch/device reboots
+# It also filters out the initial setup after reboot
+# It also filters out cases where NTP sync creates a drop of negative length
+# None of these should be significant as we are primarily interested in drops
+# that last for hours, on long running devices
+CON_LOST_MIN_LEN="60"
+
+# Name of the tag informing about the last loss of connectivity
+CON_LOST_TAG="balena_debug_1lan_con_lost"
+
+# Name of the tag marking devices with powerline connection
+PLC_DETECTED_TAG="balena_debug_powerline"
+
+# Name of the container image with debugging tools installed
+DEBUG_IMAGE="bh.cr/michalt/balena-net-debug-$(uname -m)"
+
+# Static name of the container to avoid two packet dumps running in parallel
+CONTAINER_NAME="balena_net_debug"
+
+# Packet capture duration
+# This will be passed to `timeout` as is, make sure `timeout` understands it
+PACKET_CAPTURE_DURATION="1h"
+
+
+#
+# Start
+#
+
+if [ "$2" != "connectivity-change" ]
+then
+  exit 0
+fi
+
+. /usr/libexec/os-helpers-logging
+
+# Helper function that sets a tag for the current device in balenaCloud
+# Since we do not have PUT, we need to POST or PATCH
+# Usage: set_tag KEY VALUE
+set_tag() {
+  KEY="$1"
+  VALUE="$2"
+
+  info "Trying to set tag '${KEY}' to '${VALUE}' via balena API"
+
+  # balena-config-vars complains about unknown args
+  # shift away the two we consumed to make it happy
+  shift
+  shift
+
+  . /usr/sbin/balena-config-vars
+
+  # We do not want curl to hang for too long as there might be no connectivity
+  # At the same time it might take a few seconds after recovery
+  # for the connection to be usable for an API call
+  # Cap each attempt to 5 seconds and retry 3 times before giving up
+  HTTP_CODE=$(curl "${API_ENDPOINT}/v6/device_tag" \
+    -s -o /dev/null -w "%{http_code}" \
+    -X POST \
+    -m 5 \
+    --retry 3 \
+    -H "Content-Type: application/json" \
+    -H "Authorization: Bearer ${DEVICE_API_KEY}" \
+    -d "{\"device\":\"${DEVICE_ID}\",\"tag_key\":\"${KEY}\",\"value\":\"${VALUE}\"}")
+
+  # 201 means the tag was successfully added
+  if [ "${HTTP_CODE}" = "201" ]
+  then
+    info "New tag '${KEY}' created via balena API"
+    return 0
+  fi
+
+  # 409 means the tag is already there and we need to PATCH it
+  if [ "${HTTP_CODE}" = "409" ]
+  then
+    # This does not check the return code, but there is not much more we can do anyway
+    curl "${API_ENDPOINT}/v6/device_tag?\$filter=(tag_key%20eq%20'${KEY}')%20and%20(device%20eq%20${DEVICE_ID})" \
+      -s -o /dev/null \
+      -X PATCH \
+      -m 5 \
+      --retry 3 \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${DEVICE_API_KEY}" \
+      -d "{\"value\":\"${VALUE}\"}"
+    info "Existing tag '${KEY}' updated via balena API"
+    return 0
+  fi
+
+  # Anything else is unexpected
+  warn "Failed to set tag '${KEY}' via balena API"
+  return 1
+}
+
+# These have to stay same between multiple runs of the script
+# and ideally survive a reboot
+NET_STATE_DIR="/mnt/state"
+CON_STATE_FILE="${NET_STATE_DIR}/last_connection_state"
+CON_DROP_FILE="${NET_STATE_DIR}/last_connection_drop"
+DIAG_DIR="/mnt/data/balena-net-debug"
+DIAG_LATEST_SYMLINK="${DIAG_DIR}/con-loss-latest"
+
+PLCSTAT_FILE_NAME="plcstat-t"
+
+NOW="$(date "+%s")"
+
+# Pre-pull the container image with debugging tools as soon as we can
+# No need to wait for this to complete, just start it in the background
+# If the pull gets executed more than once (e.g. on a flaky connection)
+# balenaEngine can cope with that
+if [ "${CONNECTIVITY_STATE}" = "FULL" ]
+then
+  balena pull -q "${DEBUG_IMAGE}" &
+fi
+
+# The conectivity state is "FULL" on a device with a working connection
+# On devices with no connection (primary interface down and no failover)
+# it oscillates between "NONE" (interface completely down)
+# and "LIMITED" which indicates an attempt to bring the interface back up
+# For the purpose of this script "NONE" and "LIMITED" are equivalent
+# There are other possible states, but we do not expect to see them at all
+
+# Have we seen this event before?
+if [ -f "${CON_STATE_FILE}" ]
+then
+  PREVIOUS_CON_STATE="$(cat "${CON_STATE_FILE}")"
+
+  if [ "${PREVIOUS_CON_STATE}" = "FULL" ]
+  then
+    if [ "${CONNECTIVITY_STATE}" != "FULL" ]
+    then
+      # We have detected the connection just got broken
+      # There is no point trying to call the API at this point
+      # Just log current time to use it later
+      echo "${NOW}" > "${CON_DROP_FILE}"
+      info "Detected connectivity drop"
+
+      # Run diagnostics to analyze when the device comes back
+      DIAG_DEST_DIR="${DIAG_DIR}/con-loss-${NOW}"
+      mkdir -p "${DIAG_DEST_DIR}"
+
+      # Update the latest symlink so that a subsequent
+      # recovery can also fill data in
+      ln -snf "${DIAG_DEST_DIR}" "${DIAG_LATEST_SYMLINK}"
+
+      # Capture NM logs that show the loss
+      journalctl -u NetworkManager > "${DIAG_DEST_DIR}/nm-loss.log" 2>&1
+
+      # Capture general metadata
+      ip a > "${DIAG_DEST_DIR}/ip-a" 2>&1
+      ip r > "${DIAG_DEST_DIR}/ip-r" 2>&1
+      ip -6 r > "${DIAG_DEST_DIR}/ip-r6" 2>&1
+
+      # Capture last lease
+      cp -a "/var/lib/NetworkManager/internal-"*"-${WATCH_INTERFACE}.lease" "${DIAG_DEST_DIR}/"
+
+      RUN_DEBUG_CONTAINER="balena run --rm --privileged --net host -v /:/host"
+
+      # Check for powerline adapters
+      ${RUN_DEBUG_CONTAINER} "${DEBUG_IMAGE}" plcstat -t -i "${WATCH_INTERFACE}" > "${DIAG_DEST_DIR}/${PLCSTAT_FILE_NAME}"
+
+      # Stop a previous packet capture if it is running
+      balena stop "${CONTAINER_NAME}"
+
+      # Start a packet capture on $WATCH_INTERFACE
+      ${RUN_DEBUG_CONTAINER} --name "${CONTAINER_NAME}" -d "${DEBUG_IMAGE}" timeout "${PACKET_CAPTURE_DURATION}" tcpdump -w "/host/${DIAG_DEST_DIR}/${WATCH_INTERFACE}.pcap" -i "${WATCH_INTERFACE}"
+    else
+      warn "Unexpected connectivity change from '${PREVIOUS_CON_STATE}' to '${CONNECTIVITY_STATE}'"
+    fi
+  fi
+
+  if [ "${PREVIOUS_CON_STATE}" != "FULL" ] && [ "${CONNECTIVITY_STATE}" = "FULL" ]
+  then
+    # We have detected the connection got fixed
+    # Have we seen the connection break before?
+    if [ -f "${CON_DROP_FILE}" ]
+    then
+      info "Detected connectivity back up"
+
+      # Stop the packet capture
+      # If the connection is working, we already have what we need
+      balena stop "${CONTAINER_NAME}"
+
+      # Capture NM logs that show the recovery
+      journalctl -u NetworkManager > "${DIAG_LATEST_SYMLINK}/nm-recovery.log"
+
+      DROP_TIME="$(cat "${CON_DROP_FILE}")"
+      DROP_DURATION=$["${NOW}" - "${DROP_TIME}"]
+
+      echo "${DROP_DURATION}" > "${DIAG_LATEST_SYMLINK}/duration"
+
+      # Do not report short drops
+      if [ "${DROP_DURATION}" -lt "${CON_LOST_MIN_LEN}" ]
+      then
+        info "The connection drop lasting ${DROP_DURATION} seconds seems too short to report"
+      else
+        # Report the drop to the API
+        set_tag "${CON_LOST_TAG}" "${DROP_TIME} - ${NOW} (${DROP_DURATION} seconds)"
+      fi
+
+      if [ -s "${DIAG_LATEST_SYMLINK}/${PLCSTAT_FILE_NAME}" ]
+      then
+        # Mark devices on powerline
+        set_tag "${PLC_DETECTED_TAG}" "true"
+      fi
+    else
+      warn "The connection seems to get fixed, but we did not see it break, maybe initial setup?"
+    fi
+
+    # The drop file should only exist while the connection is broken
+    rm -f "${CON_DROP_FILE}"
+  fi
+fi
+
+echo "${CONNECTIVITY_STATE}" > "${CON_STATE_FILE}"
